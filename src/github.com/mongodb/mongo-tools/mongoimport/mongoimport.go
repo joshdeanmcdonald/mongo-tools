@@ -50,6 +50,7 @@ var (
 	insertionLock          = &sync.Mutex{}
 	insertionCount         = uint64(0)
 	numProcessingThreads   = 1
+	batchSize              = 1
 	maintainInsertionOrder = false
 )
 
@@ -317,6 +318,9 @@ func (mongoImport *MongoImport) importDocuments(inputReader InputReader) (uint64
 		}
 	}
 
+	// set the batch size for ingestion
+	batchSize = *mongoImport.IngestOptions.BatchSize
+
 	// set the number of processing threads and batch size
 	readDocChanSize := *mongoImport.IngestOptions.BatchSize *
 		*mongoImport.IngestOptions.NumProcessingThreads
@@ -382,7 +386,6 @@ func (mongoImport *MongoImport) IngestDocuments(readChan chan bson.D) (err error
 // read channel and prepares then for insertion into the database
 func (mongoImport *MongoImport) ingestDocs(readChan chan bson.D) (err error) {
 	ignoreBlanks := mongoImport.IngestOptions.IgnoreBlanks && mongoImport.InputOptions.Type != JSON
-	batchSize := *mongoImport.IngestOptions.BatchSize
 	documentBytes := make([]byte, 0)
 	documents := make([]interface{}, 0)
 	numMessageBytes := 0

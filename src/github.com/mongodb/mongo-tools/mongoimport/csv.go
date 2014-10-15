@@ -23,8 +23,14 @@ type CSVInputReader struct {
 	numProcessed int64
 	// csvRecord stores each line of input we read from the underlying reader
 	csvRecord []string
-	// document is used to hold the decoded JSON document as a bson.M
-	document bson.M
+	// internal synchronization helpers
+	isProcessing    bool
+	startProcessing chan bool
+	hasProcessed    chan bool
+	// document is used to hold the processed CSV document as a bson.D
+	csvOut bson.D
+	// document is used to hold the input CSV document to process
+	csvIn []string
 }
 
 // NewCSVInputReader returns a CSVInputReader configured to read input from the
@@ -41,99 +47,151 @@ func NewCSVInputReader(fields []string, in io.Reader) *CSVInputReader {
 }
 
 // SetHeader sets the header field for a CSV
-func (csvImporter *CSVInputReader) SetHeader(hasHeaderLine bool) (err error) {
-	fields, err := validateHeaders(csvImporter, hasHeaderLine)
+func (csvInputReader *CSVInputReader) SetHeader(hasHeaderLine bool) (err error) {
+	fields, err := validateHeaders(csvInputReader, hasHeaderLine)
 	if err != nil {
 		return err
 	}
-	csvImporter.Fields = fields
+	csvInputReader.Fields = fields
 	return nil
 }
 
 // GetHeaders returns the current header fields for a CSV importer
-func (csvImporter *CSVInputReader) GetHeaders() []string {
-	return csvImporter.Fields
+func (csvInputReader *CSVInputReader) GetHeaders() []string {
+	return csvInputReader.Fields
 }
 
 // ReadHeadersFromSource reads the header field from the CSV importer's reader
-func (csvImporter *CSVInputReader) ReadHeadersFromSource() ([]string, error) {
-	return csvImporter.csvReader.Read()
+func (csvInputReader *CSVInputReader) ReadHeadersFromSource() ([]string, error) {
+	return csvInputReader.csvReader.Read()
 }
 
 // StreamDocument takes in two channels: it sends processed documents on the
 // readChan channel and if any error is encountered, that is sent in the errChan
 // channel. It keeps reading from the underlying input source until it hits EOF
 // or an error
-func (csvImporter *CSVInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
+func (csvInputReader *CSVInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
 	csvRecordChan := make(chan []string, numProcessingThreads)
 	var err error
 
 	go func() {
 		for {
-			csvImporter.csvRecord, err = csvImporter.csvReader.Read()
+			csvInputReader.csvRecord, err = csvInputReader.csvReader.Read()
 			if err != nil {
 				close(csvRecordChan)
 				if err == io.EOF {
 					errChan <- err
 					return
 				}
-				csvImporter.numProcessed++
-				errChan <- fmt.Errorf("read error on entry #%v: %v", csvImporter.numProcessed, err)
+				csvInputReader.numProcessed++
+				errChan <- fmt.Errorf("read error on entry #%v: %v", csvInputReader.numProcessed, err)
 				return
 			}
-			csvRecordChan <- csvImporter.csvRecord
-			csvImporter.numProcessed++
+			csvRecordChan <- csvInputReader.csvRecord
+			csvInputReader.numProcessed++
 		}
 	}()
 
-	var wg sync.WaitGroup
-	for i := 0; i < numProcessingThreads; i++ {
-		wg.Add(1)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Logf(0, "error decoding CSV: %v", r)
-				}
-				wg.Done()
+	if maintainInsertionOrder {
+		csvInputReader.processInSequence(csvRecordChan, readChan)
+	} else {
+		wg := &sync.WaitGroup{}
+		for i := 0; i < numProcessingThreads; i++ {
+			wg.Add(1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Logf(0, "error decoding CSV: %v", r)
+					}
+					wg.Done()
+				}()
+				csvInputReader.sendCSV(csvRecordChan, readChan)
 			}()
-			csvImporter.sendCSV(csvRecordChan, readChan)
-		}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 	close(readChan)
 }
 
-// sendCSV reads in data from the csvRecordChan channel and creates a BSON document
-// based on the record. It sends this document on the readChan channel if there
-// are no errors. If any error is encountered, it sends this on the errChan
-// channel and returns immediately
-func (csvImporter *CSVInputReader) sendCSV(csvRecordChan chan []string, readChan chan bson.D) {
-	var key string
-	var parsedValue interface{}
-	var document bson.D
-
+// sendCSV reads from the csvRecordChan and for each read record, converts it to
+// a bson.D document before sending it on the readChan channel
+func (csvInputReader *CSVInputReader) sendCSV(csvRecordChan chan []string, readChan chan bson.D) {
 	for csvRecord := range csvRecordChan {
-		log.Logf(2, "got line: %v", csvRecord)
-		document = bson.D{}
-		for index, token := range csvRecord {
-			parsedValue = getParsedValue(token)
-			if index < len(csvImporter.Fields) {
-				// for nested fields - in the form "a.b.c", ensure
-				// that the value is set accordingly
-				if strings.Index(csvImporter.Fields[index], ".") != -1 {
-					setNestedValue(csvImporter.Fields[index], parsedValue, &document)
-				} else {
-					document = append(document, bson.DocElem{csvImporter.Fields[index], parsedValue})
-				}
+		readChan <- csvInputReader.csvRecordToBSON(csvRecord)
+	}
+}
+
+// csvRecordToBSON reads in slice of CSV record and returns a BSON document based
+// on the record.
+func (csvInputReader *CSVInputReader) csvRecordToBSON(csvRecord []string) (document bson.D) {
+	log.Logf(2, "got line: %v", csvRecord)
+	var parsedValue interface{}
+	for index, token := range csvRecord {
+		parsedValue = getParsedValue(token)
+		if index < len(csvInputReader.Fields) {
+			// for nested fields - in the form "a.b.c", ensure
+			// that the value is set accordingly
+			if strings.Index(csvInputReader.Fields[index], ".") != -1 {
+				setNestedValue(csvInputReader.Fields[index], parsedValue, &document)
 			} else {
-				key = "field" + string(index)
-				if util.StringSliceContains(csvImporter.Fields, key) {
-					panic(fmt.Sprintf("Duplicate header name - on %v - for token #%v ('%v') in document #%v",
-						key, index+1, parsedValue, csvImporter.numProcessed))
-				}
-				document = append(document, bson.DocElem{csvImporter.Fields[index], parsedValue})
+				document = append(document, bson.DocElem{csvInputReader.Fields[index], parsedValue})
 			}
+		} else {
+			key := "field" + string(index)
+			if util.StringSliceContains(csvInputReader.Fields, key) {
+				panic(fmt.Sprintf("Duplicate header name - on %v - for token #%v ('%v') in document #%v",
+					key, index+1, parsedValue, csvInputReader.numProcessed))
+			}
+			document = append(document, bson.DocElem{csvInputReader.Fields[index], parsedValue})
 		}
-		readChan <- document
+	}
+	return
+}
+
+// processInSequence concurrently processes data gotten from the csvRecordChan
+// channel in parallel and then sends over the processed data to the readChan
+// channel in sequence in which the data was received
+func (csvInputReader *CSVInputReader) processInSequence(csvRecordChan chan []string, readChan chan bson.D) {
+	var csvWorkerThread []*CSVInputReader
+	// initialize all our concurrent processing threads
+	for i := 0; i < numProcessingThreads; i++ {
+		csvWorker := &CSVInputReader{
+			Fields:          csvInputReader.Fields,
+			hasProcessed:    make(chan bool),
+			startProcessing: make(chan bool),
+		}
+		csvWorkerThread = append(csvWorkerThread, csvWorker)
+	}
+	i := 0
+	// feed in the CSV line to be processed and do round-robin
+	// reads from each worker once processing is completed
+	for csvRecord := range csvRecordChan {
+		if csvWorkerThread[i].isProcessing {
+			<-csvWorkerThread[i].hasProcessed
+			readChan <- csvWorkerThread[i].csvOut
+		} else {
+			csvWorkerThread[i].isProcessing = true
+			go csvWorkerThread[i].processCSV()
+		}
+		csvWorkerThread[i].csvIn = csvRecord
+		csvWorkerThread[i].startProcessing <- true
+		i = (i + 1) % numProcessingThreads
+	}
+	// drain any thread that's still in the middle of processing
+	for i := 0; i < numProcessingThreads; i++ {
+		if csvWorkerThread[i].isProcessing {
+			<-csvWorkerThread[i].hasProcessed
+			readChan <- csvWorkerThread[i].csvOut
+			close(csvWorkerThread[i].startProcessing)
+		}
+	}
+}
+
+// processCSV waits on the startProcessing channel to process data and sends
+// a signal when it's done processing
+func (csvInputReader *CSVInputReader) processCSV() {
+	for <-csvInputReader.startProcessing {
+		csvInputReader.csvOut = csvRecordToBSON(csvInputReader.csvIn)
+		csvInputReader.hasProcessed <- true
 	}
 }

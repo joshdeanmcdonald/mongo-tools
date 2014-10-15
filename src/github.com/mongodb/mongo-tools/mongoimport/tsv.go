@@ -142,7 +142,7 @@ func (tsvImporter *TSVInputReader) sendTSV(tsvRecordChan chan string, readChan c
 					panic(fmt.Sprintf("Duplicate header name - on %v - for token #%v ('%v') in document #%v",
 						key, index+1, parsedValue, tsvImporter.numProcessed))
 				}
-				document = append(document, bson.DocElem{tsvImporter.Fields[index], parsedValue})
+				document = append(document, bson.DocElem{key, parsedValue})
 			}
 		}
 		readChan <- document
