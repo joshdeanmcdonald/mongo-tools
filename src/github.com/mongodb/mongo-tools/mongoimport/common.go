@@ -4,19 +4,10 @@ import (
 	"fmt"
 	"github.com/mongodb/mongo-tools/common/log"
 	"gopkg.in/mgo.v2/bson"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 )
-
-func convertToBsonD(document bson.M) (bsonD bson.D) {
-	bsonD = bson.D{}
-	for key, value := range document {
-		bsonD = append(bsonD, bson.DocElem{key, value})
-	}
-	return
-}
 
 // constructUpsertDocument constructs a BSON document to use for upserts
 func constructUpsertDocument(upsertFields []string, document bson.M) bson.M {
@@ -74,18 +65,18 @@ func getUpsertValue(field string, document bson.M) interface{} {
 // removeBlankFields removes empty/blank fields in csv and tsv
 func removeBlankFields(document bson.D) bson.D {
 	for index, pair := range document {
-		value := pair.Value
-		if reflect.TypeOf(value).Kind() == reflect.String && value.(string) == "" {
+		if _, ok := pair.Value.(string); ok && pair.Value.(string) == "" {
 			document = append(document[:index], document[index+1:]...)
 		}
 	}
 	return document
 }
 
-func getElem(left string, document *bson.D) interface{} {
-	for _, elem := range *document {
-		if elem.Name == left {
-			return elem.Value
+// getKeyValue gets the value of keyName in document
+func getKeyValue(keyName string, document *bson.D) interface{} {
+	for _, key := range *document {
+		if key.Name == keyName {
+			return key.Value
 		}
 	}
 	return nil
@@ -100,9 +91,9 @@ func setNestedValue(key string, value interface{}, document *bson.D) {
 		*document = append(*document, bson.DocElem{key, value})
 		return
 	}
-	left := key[0:index]
+	keyName := key[0:index]
 	subDocument := &bson.D{}
-	elem := getElem(left, document)
+	elem := getKeyValue(keyName, document)
 	var existingKey bool
 	if elem != nil {
 		subDocument = elem.(*bson.D)
@@ -110,7 +101,7 @@ func setNestedValue(key string, value interface{}, document *bson.D) {
 	}
 	setNestedValue(key[index+1:], value, subDocument)
 	if !existingKey {
-		*document = append(*document, bson.DocElem{left, subDocument})
+		*document = append(*document, bson.DocElem{keyName, subDocument})
 	}
 }
 

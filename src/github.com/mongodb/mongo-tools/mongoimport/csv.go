@@ -60,11 +60,12 @@ func (csvImporter *CSVInputReader) ReadHeadersFromSource() ([]string, error) {
 	return csvImporter.csvReader.Read()
 }
 
-// ReadDocument reads a line of input with the CSV representation of a document
-// and writes the BSON equivalent to the provided read channel; if it encounters
-// an error in reading, it sends that error on the error channel.
-func (csvImporter *CSVInputReader) ReadDocument(readChan chan bson.D, errChan chan error) {
-	csvRecordChan := make(chan []string, numWorkers)
+// StreamDocument takes in two channels: it sends processed documents on the
+// readChan channel and if any error is encountered, that is sent in the errChan
+// channel. It keeps reading from the underlying input source until it hits EOF
+// or an error
+func (csvImporter *CSVInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
+	csvRecordChan := make(chan []string, numProcessingThreads)
 	var err error
 
 	go func() {
@@ -72,11 +73,13 @@ func (csvImporter *CSVInputReader) ReadDocument(readChan chan bson.D, errChan ch
 			csvImporter.csvRecord, err = csvImporter.csvReader.Read()
 			if err != nil {
 				close(csvRecordChan)
-				csvImporter.numProcessed++
 				if err == io.EOF {
 					errChan <- err
+					return
 				}
+				csvImporter.numProcessed++
 				errChan <- fmt.Errorf("read error on entry #%v: %v", csvImporter.numProcessed, err)
+				return
 			}
 			csvRecordChan <- csvImporter.csvRecord
 			csvImporter.numProcessed++
@@ -84,14 +87,14 @@ func (csvImporter *CSVInputReader) ReadDocument(readChan chan bson.D, errChan ch
 	}()
 
 	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < numProcessingThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer func() {
-				wg.Done()
 				if r := recover(); r != nil {
 					log.Logf(0, "error decoding CSV: %v", r)
 				}
+				wg.Done()
 			}()
 			csvImporter.sendCSV(csvRecordChan, readChan)
 		}()

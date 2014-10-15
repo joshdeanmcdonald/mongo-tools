@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -42,14 +43,14 @@ var (
 const (
 	maxBSONSize         = 16 * (1024 * 1024)
 	maxMessageSizeBytes = 2 * maxBSONSize
-	maxWriteBatchSize   = 1000
 )
 
 // variables used by the input/ingestion goroutines
 var (
-	insertionLock  = &sync.Mutex{}
-	insertionCount = uint64(0)
-	numWorkers     = 1
+	insertionLock          = &sync.Mutex{}
+	insertionCount         = uint64(0)
+	numProcessingThreads   = 1
+	maintainInsertionOrder = false
 )
 
 // Wrapper for MongoImport functionality
@@ -70,11 +71,11 @@ type MongoImport struct {
 // InputReader is an interface that specifies how an input source should be
 // converted to BSON
 type InputReader interface {
-	// ReadDocument reads the given record from the given io.Reader according
+	// StreamDocument reads the given record from the given io.Reader according
 	// to the format supported by the underlying InputReader implementation. It
 	// returns the documents read on the bson.M channel and also puts any errors
 	// it encounters on the error channel
-	ReadDocument(chan bson.D, chan error)
+	StreamDocument(chan bson.D, chan error)
 
 	// SetHeader sets the header for the CSV/TSV import when --headerline is
 	// specified. It a --fields or --fieldFile argument is passed, it overwrites
@@ -150,13 +151,13 @@ func (mongoImport *MongoImport) ValidateSettings(args []string) error {
 
 	// ensure no more than one positional argument is supplied
 	if len(args) > 1 {
-		return fmt.Errorf("too many positional arguments")
+		return fmt.Errorf("only one positional argument is allowed")
 	}
 
 	// ensure either a positional argument is supplied or an argument is passed
 	// to the --file flag - and not both
 	if mongoImport.InputOptions.File != "" && len(args) != 0 {
-		return fmt.Errorf(`multiple occurrences of option "--file"`)
+		return fmt.Errorf("incompatible options: --file and positional argument(s)")
 	}
 
 	var fileBaseName string
@@ -187,6 +188,44 @@ func (mongoImport *MongoImport) ValidateSettings(args []string) error {
 		log.Logf(0, "using filename '%v' as collection",
 			mongoImport.ToolOptions.Namespace.Collection)
 	}
+
+	numCPU := runtime.NumCPU()
+
+	// set the number of operating system threads to use for imports
+	if mongoImport.IngestOptions.NumOSThreads == nil {
+		runtime.GOMAXPROCS(numCPU)
+	} else {
+		if *mongoImport.IngestOptions.NumOSThreads < 1 {
+			return fmt.Errorf("--numOSThreads argument must be > 0")
+		}
+		runtime.GOMAXPROCS(*mongoImport.IngestOptions.NumOSThreads)
+	}
+
+	// set the number of processing threads to use for imports
+	if mongoImport.IngestOptions.NumProcessingThreads == nil {
+		numProcessingThreads = numCPU
+		mongoImport.IngestOptions.NumProcessingThreads = &numCPU
+	} else {
+		if *mongoImport.IngestOptions.NumProcessingThreads < 1 {
+			return fmt.Errorf("--numProcessingThreads argument must be > 0")
+		}
+		numProcessingThreads = *mongoImport.IngestOptions.NumProcessingThreads
+	}
+
+	// set the number of ingestion threads to use for imports
+	if mongoImport.IngestOptions.NumIngestionThreads == nil {
+		mongoImport.IngestOptions.NumIngestionThreads = &numCPU
+	} else if *mongoImport.IngestOptions.NumIngestionThreads < 1 {
+		return fmt.Errorf("--numIngestionThreads argument must be > 0")
+	}
+
+	// if maintain --maintainInsertionOrder is true, we can only have one
+	// ingestion thread
+	if mongoImport.IngestOptions.MaintainInsertionOrder {
+		maintainInsertionOrder = true
+		*mongoImport.IngestOptions.NumIngestionThreads = 1
+	}
+
 	return nil
 }
 
@@ -278,12 +317,13 @@ func (mongoImport *MongoImport) importDocuments(inputReader InputReader) (uint64
 		}
 	}
 
-	// set the number of worker threads
-	numWorkers = mongoImport.IngestOptions.NumThreads
+	// set the number of processing threads and batch size
+	readDocChanSize := *mongoImport.IngestOptions.BatchSize *
+		*mongoImport.IngestOptions.NumProcessingThreads
 
-	// readDocChan is buffered with maxWriteBatchSize * numWorkers
-	// to ensure we never block reading
-	readDocChan := make(chan bson.D, maxWriteBatchSize*numWorkers)
+	// readDocChan is buffered with readDocChanSize to ensure we only block
+	// accepting reads if processing is slow
+	readDocChan := make(chan bson.D, readDocChanSize)
 
 	// any read errors should cause mongoimport to stop
 	// ingestion and immediately terminate; thus, we
@@ -291,7 +331,7 @@ func (mongoImport *MongoImport) importDocuments(inputReader InputReader) (uint64
 	readErrChan := make(chan error)
 
 	// handle all input reads in a separate goroutine
-	go inputReader.ReadDocument(readDocChan, readErrChan)
+	go inputReader.StreamDocument(readDocChan, readErrChan)
 
 	// return immediately on ingest errors - these will be triggered
 	// either by an issue ingesting data or if the read channel is
@@ -306,15 +346,16 @@ func (mongoImport *MongoImport) importDocuments(inputReader InputReader) (uint64
 // IngestDocuments takes a slice of documents and either inserts/upserts them -
 // based on whether an upsert is requested - into the given collection
 func (mongoImport *MongoImport) IngestDocuments(readChan chan bson.D) (err error) {
-	ingestErr := make(chan error, numWorkers)
+	numIngestionThreads := *mongoImport.IngestOptions.NumIngestionThreads
+	ingestErr := make(chan error, numIngestionThreads)
 
 	// spawn all the worker threads, each in its own goroutine
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < numIngestionThreads; i++ {
 		go func() {
 			ingestErr <- mongoImport.ingestDocs(readChan)
 		}()
 	}
-	doneWorkers := 0
+	doneIngestionThreads := 0
 
 	// Each ingest worker will return an error which may
 	// be nil or not. It will be not nil in any of this cases:
@@ -325,12 +366,12 @@ func (mongoImport *MongoImport) IngestDocuments(readChan chan bson.D) (err error
 	//    error - and stopOnError is set to true
 
 	for err = range ingestErr {
-		doneWorkers++
+		doneIngestionThreads++
 		// TODO suggestion: perhaps signal other workers to terminate immediately
 		if err != nil {
 			return
 		}
-		if doneWorkers == numWorkers {
+		if doneIngestionThreads == numIngestionThreads {
 			return
 		}
 	}
@@ -341,6 +382,7 @@ func (mongoImport *MongoImport) IngestDocuments(readChan chan bson.D) (err error
 // read channel and prepares then for insertion into the database
 func (mongoImport *MongoImport) ingestDocs(readChan chan bson.D) (err error) {
 	ignoreBlanks := mongoImport.IngestOptions.IgnoreBlanks && mongoImport.InputOptions.Type != JSON
+	batchSize := *mongoImport.IngestOptions.BatchSize
 	documentBytes := make([]byte, 0)
 	documents := make([]interface{}, 0)
 	numMessageBytes := 0
@@ -350,7 +392,20 @@ func (mongoImport *MongoImport) ingestDocs(readChan chan bson.D) (err error) {
 	if err != nil {
 		return fmt.Errorf("error connecting to mongod: %v", err)
 	}
+
+	// sockets to the database will never be forcibly closed
 	session.SetSocketTimeout(0)
+
+	// set safe mode if specified by user; if no write concern
+	// is specified, use "majority"
+	safety := &mgo.Safe{}
+	if mongoImport.IngestOptions.WriteConcern == nil {
+		safety.WMode = "majority"
+	} else {
+		safety.W = *mongoImport.IngestOptions.WriteConcern
+	}
+	session.SetSafe(safety)
+
 	defer session.Close()
 
 	collection := session.DB(mongoImport.ToolOptions.DB).
@@ -368,9 +423,9 @@ func (mongoImport *MongoImport) ingestDocs(readChan chan bson.D) (err error) {
 		numMessageBytes += len(documentBytes)
 		documents = append(documents, bson.Raw{3, documentBytes})
 
-		// send documents over the wire when we hit the batch size or are at/over
-		// the maximum message size threshold
-		if len(documents) == maxWriteBatchSize ||
+		// send documents over the wire when we hit the batch size
+		// or are at/over the maximum message size threshold
+		if len(documents) == batchSize ||
 			numMessageBytes >= maxMessageSizeBytes {
 			if err = mongoImport.ingester(documents, collection); err != nil {
 				return err
@@ -378,7 +433,6 @@ func (mongoImport *MongoImport) ingestDocs(readChan chan bson.D) (err error) {
 			if insertionCount%10000 == 0 {
 				log.Logf(0, "Progress: %v documents inserted...", insertionCount)
 			}
-			log.Logf(1, "Progress: %v documents inserted...", insertionCount)
 			documents = documents[:0]
 			numMessageBytes = 0
 		}
@@ -395,11 +449,11 @@ func (mongoImport *MongoImport) ingestDocs(readChan chan bson.D) (err error) {
 // present in the document to be inserted, it simply inserts the documents
 // into the given collection
 func (mongoImport *MongoImport) ingester(documents []interface{}, collection *mgo.Collection) (err error) {
-	selector := bson.M{}
-	upsertFields := strings.Split(mongoImport.IngestOptions.UpsertFields, ",")
 	// TODO: need a way of doing ordered/unordered
 	// bulk updates using write commands
 	if mongoImport.IngestOptions.Upsert {
+		selector := bson.M{}
+		upsertFields := strings.Split(mongoImport.IngestOptions.UpsertFields, ",")
 		for _, d := range documents {
 			var document bson.M
 			if err = bson.Unmarshal(d.(bson.Raw).Data, &document); err != nil {
@@ -422,6 +476,9 @@ func (mongoImport *MongoImport) ingester(documents []interface{}, collection *mg
 			}
 		}
 	} else {
+		// mgo.Bulk doesn't currently implement write commands so
+		// mgo.BulkResult isn't informative
+		// _, err = bulk.Run()
 		err = collection.Insert(documents...)
 		if err != nil {
 			if mongoImport.IngestOptions.StopOnError ||

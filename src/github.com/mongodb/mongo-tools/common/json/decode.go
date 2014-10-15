@@ -171,9 +171,7 @@ func (d *decodeState) unmarshalMap() (out map[string]interface{}, err error) {
 	// We decode rv not rv.Elem because the Unmarshaler interface
 	// test must be applied at the top level of the value.
 	out = d.document()
-	//return d.document()
 	return out, d.savedError
-	//return d.savedError
 }
 
 func (d *decodeState) unmarshalBsonD() (out bson.D, err error) {

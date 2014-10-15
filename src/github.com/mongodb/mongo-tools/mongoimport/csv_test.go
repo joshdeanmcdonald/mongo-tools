@@ -18,28 +18,28 @@ func init() {
 	})
 }
 
-func TestCSVReadDocument(t *testing.T) {
+func TestCSVStreamDocument(t *testing.T) {
 	Convey("With a CSV import input", t, func() {
 		var err error
 		Convey("badly encoded csv should result in a parsing error", func() {
 			contents := `1, 2, foo"bar`
 			fields := []string{"a", "b", "c"}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			_, err = csvImporter.ReadDocument()
+			_, err = csvImporter.StreamDocument()
 			So(err, ShouldNotBeNil)
 		})
 		Convey("escaped quotes are parsed correctly", func() {
 			contents := `1, 2, "foo""bar"`
 			fields := []string{"a", "b", "c"}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			_, err = csvImporter.ReadDocument()
+			_, err = csvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 		})
 		Convey("whitespace separated quoted strings are still an error", func() {
 			contents := `1, 2, "foo"  "bar"`
 			fields := []string{"a", "b", "c"}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			_, err = csvImporter.ReadDocument()
+			_, err = csvImporter.StreamDocument()
 			So(err, ShouldNotBeNil)
 		})
 		Convey("multiple escaped quotes separated by whitespace parsed correctly", func() {
@@ -51,7 +51,7 @@ func TestCSVReadDocument(t *testing.T) {
 				"c": `foo" "bar`,
 			}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := csvImporter.ReadDocument()
+			bsonDoc, err := csvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedRead)
 		})
@@ -64,7 +64,7 @@ func TestCSVReadDocument(t *testing.T) {
 				"c": " 3e",
 			}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := csvImporter.ReadDocument()
+			bsonDoc, err := csvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedRead)
 		})
@@ -79,7 +79,7 @@ func TestCSVReadDocument(t *testing.T) {
 				"field3": " may",
 			}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := csvImporter.ReadDocument()
+			bsonDoc, err := csvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedRead)
 		})
@@ -96,7 +96,7 @@ func TestCSVReadDocument(t *testing.T) {
 				"field3": " may",
 			}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := csvImporter.ReadDocument()
+			bsonDoc, err := csvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedRead)
 		})
@@ -105,11 +105,11 @@ func TestCSVReadDocument(t *testing.T) {
 			contents := `1, 2f , " 3e" , " may", june`
 			fields := []string{"a", "b.c", "field3"}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			_, err := csvImporter.ReadDocument()
+			_, err := csvImporter.StreamDocument()
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("calling ReadDocument() for CSVs should return next set of "+
+		Convey("calling StreamDocument() for CSVs should return next set of "+
 			"values", func() {
 			contents := "1, 2, 3\n4, 5, 6"
 			fields := []string{"a", "b", "c"}
@@ -124,10 +124,10 @@ func TestCSVReadDocument(t *testing.T) {
 				"c": 6,
 			}
 			csvImporter := NewCSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := csvImporter.ReadDocument()
+			bsonDoc, err := csvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedReadOne)
-			bsonDoc, err = csvImporter.ReadDocument()
+			bsonDoc, err = csvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedReadTwo)
 		})
@@ -244,10 +244,10 @@ func TestCSVSetHeader(t *testing.T) {
 				fileHandle, err := os.Open("testdata/test.csv")
 				So(err, ShouldBeNil)
 				csvImporter := NewCSVInputReader(fields, fileHandle)
-				bsonDoc, err := csvImporter.ReadDocument()
+				bsonDoc, err := csvImporter.StreamDocument()
 				So(err, ShouldBeNil)
 				So(bsonDoc, ShouldResemble, expectedReadOne)
-				bsonDoc, err = csvImporter.ReadDocument()
+				bsonDoc, err = csvImporter.StreamDocument()
 				So(err, ShouldBeNil)
 				So(bsonDoc, ShouldResemble, expectedReadTwo)
 			})

@@ -41,6 +41,8 @@ func ConvertJSONDocumentToBSON(doc map[string]interface{}) error {
 	return nil
 }
 
+// GetExtendedBsonD takes a bson.D document and adds type
+// information for each key in the document
 func GetExtendedBsonD(doc bson.D) (bson.D, error) {
 	var err error
 	var bsonDoc bson.D

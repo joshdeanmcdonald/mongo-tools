@@ -12,7 +12,7 @@ import (
 )
 
 // TODO: currently doesn't work for lines like `a, b, "cccc,cccc", d`
-func TestTSVReadDocument(t *testing.T) {
+func TestTSVStreamDocument(t *testing.T) {
 
 	Convey("With a TSV import input", t, func() {
 		Convey("integer valued strings should be converted", func() {
@@ -24,7 +24,7 @@ func TestTSVReadDocument(t *testing.T) {
 				"c": "3e",
 			}
 			tsvImporter := NewTSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := tsvImporter.ReadDocument()
+			bsonDoc, err := tsvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedRead)
 		})
@@ -39,7 +39,7 @@ func TestTSVReadDocument(t *testing.T) {
 				"field3": " may",
 			}
 			tsvImporter := NewTSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := tsvImporter.ReadDocument()
+			bsonDoc, err := tsvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedRead)
 		})
@@ -54,12 +54,12 @@ func TestTSVReadDocument(t *testing.T) {
 				"d": 14,
 			}
 			tsvImporter := NewTSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := tsvImporter.ReadDocument()
+			bsonDoc, err := tsvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedRead)
 		})
 
-		Convey("calling ReadDocument() in succession for TSVs should "+
+		Convey("calling StreamDocument() in succession for TSVs should "+
 			"return the correct next set of values", func() {
 			contents := "1\t2\t3\n4\t5\t6\n"
 			fields := []string{"a", "b", "c"}
@@ -74,15 +74,15 @@ func TestTSVReadDocument(t *testing.T) {
 				"c": 6,
 			}
 			tsvImporter := NewTSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := tsvImporter.ReadDocument()
+			bsonDoc, err := tsvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedReadOne)
-			bsonDoc, err = tsvImporter.ReadDocument()
+			bsonDoc, err = tsvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedReadTwo)
 		})
 
-		Convey("calling ReadDocument() in succession for TSVs that contain "+
+		Convey("calling StreamDocument() in succession for TSVs that contain "+
 			"quotes should return the correct next set of values", func() {
 			contents := "1\t2\t3\n4\t\"\t6\n"
 			fields := []string{"a", "b", "c"}
@@ -97,10 +97,10 @@ func TestTSVReadDocument(t *testing.T) {
 				"c": 6,
 			}
 			tsvImporter := NewTSVInputReader(fields, bytes.NewReader([]byte(contents)))
-			bsonDoc, err := tsvImporter.ReadDocument()
+			bsonDoc, err := tsvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedReadOne)
-			bsonDoc, err = tsvImporter.ReadDocument()
+			bsonDoc, err = tsvImporter.StreamDocument()
 			So(err, ShouldBeNil)
 			So(bsonDoc, ShouldResemble, expectedReadTwo)
 		})
@@ -114,10 +114,10 @@ func TestTSVReadDocument(t *testing.T) {
 				fileHandle, err := os.Open("testdata/test.tsv")
 				So(err, ShouldBeNil)
 				tsvImporter := NewTSVInputReader(fields, fileHandle)
-				bsonDoc, err := tsvImporter.ReadDocument()
+				bsonDoc, err := tsvImporter.StreamDocument()
 				So(err, ShouldBeNil)
 				So(bsonDoc, ShouldResemble, expectedReadOne)
-				bsonDoc, err = tsvImporter.ReadDocument()
+				bsonDoc, err = tsvImporter.StreamDocument()
 				So(err, ShouldBeNil)
 				So(bsonDoc, ShouldResemble, expectedReadTwo)
 			})

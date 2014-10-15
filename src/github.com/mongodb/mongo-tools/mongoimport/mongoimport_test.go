@@ -356,7 +356,7 @@ func TestGetInputReader(t *testing.T) {
 	})
 }
 
-func TestReadDocuments(t *testing.T) {
+func TestStreamDocuments(t *testing.T) {
 	Convey("Given a mongoimport instance with which to import documents, on "+
 		"calling importDocuments", t, func() {
 		Convey("no error should be thrown for CSV import on test data and all "+
@@ -774,7 +774,7 @@ func checkOnlyHasDocuments(expectedDocuments []bson.M) error {
 }
 
 // getBasicToolOptions returns a test helper to instantiate the session provider
-// for calls to ReadDocument
+// for calls to StreamDocument
 func getBasicToolOptions() *commonOpts.ToolOptions {
 	ssl := &commonOpts.SSL{
 		UseSSL: false,

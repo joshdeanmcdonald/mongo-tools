@@ -84,10 +84,12 @@ func (jsonImporter *JSONInputReader) ReadHeadersFromSource() ([]string, error) {
 	return nil, nil
 }
 
-// ReadDocument reads a line of input with the JSON representation of a document
-// and writes the BSON equivalent to the provided channel
-func (jsonImporter *JSONInputReader) ReadDocument(readChan chan bson.D, errChan chan error) {
-	rawChan := make(chan []byte, numWorkers)
+// StreamDocument takes in two channels: it sends processed documents on the
+// readChan channel and if any error is encountered, that is sent in the errChan
+// channel. It keeps reading from the underlying input source until it hits EOF
+// or an error
+func (jsonImporter *JSONInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
+	rawChan := make(chan []byte, numProcessingThreads)
 	var err error
 	go func() {
 		for {
@@ -96,9 +98,11 @@ func (jsonImporter *JSONInputReader) ReadDocument(readChan chan bson.D, errChan 
 					close(rawChan)
 					if err == io.EOF {
 						errChan <- err
+						return
 					}
 					jsonImporter.numProcessed++
 					errChan <- fmt.Errorf("error reading separator after document #%v: %v", jsonImporter.numProcessed, err)
+					return
 				}
 			}
 			rawBytes, err := jsonImporter.Decoder.ScanObject()
@@ -113,14 +117,14 @@ func (jsonImporter *JSONInputReader) ReadDocument(readChan chan bson.D, errChan 
 	}()
 
 	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < numProcessingThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer func() {
-				wg.Done()
 				if r := recover(); r != nil {
 					log.Logf(0, "error decoding JSON: %v", r)
 				}
+				wg.Done()
 			}()
 			jsonImporter.decodeJSON(rawChan, readChan)
 		}()

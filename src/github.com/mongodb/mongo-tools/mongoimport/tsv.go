@@ -70,10 +70,12 @@ func (tsvImporter *TSVInputReader) ReadHeadersFromSource() ([]string, error) {
 	return unsortedHeaders, nil
 }
 
-// ReadDocument reads a line of input with the TSV representation of a document
-// and writes the BSON equivalent to the provided channel
-func (tsvImporter *TSVInputReader) ReadDocument(readChan chan bson.D, errChan chan error) {
-	tsvRecordChan := make(chan string, numWorkers)
+// StreamDocument takes in two channels: it sends processed documents on the
+// readChan channel and if any error is encountered, that is sent in the errChan
+// channel. It keeps reading from the underlying input source until it hits EOF
+// or an error
+func (tsvImporter *TSVInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
+	tsvRecordChan := make(chan string, numProcessingThreads)
 	var err error
 
 	go func() {
@@ -83,9 +85,11 @@ func (tsvImporter *TSVInputReader) ReadDocument(readChan chan bson.D, errChan ch
 				close(tsvRecordChan)
 				if err == io.EOF {
 					errChan <- err
+					return
 				}
 				tsvImporter.numProcessed++
 				errChan <- fmt.Errorf("read error on entry #%v: %v", tsvImporter.numProcessed, err)
+				return
 			}
 			tsvRecordChan <- tsvImporter.tsvRecord
 			tsvImporter.numProcessed++
@@ -93,14 +97,14 @@ func (tsvImporter *TSVInputReader) ReadDocument(readChan chan bson.D, errChan ch
 	}()
 
 	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < numProcessingThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer func() {
-				wg.Done()
 				if r := recover(); r != nil {
 					log.Logf(0, "error decoding TSV: %v", r)
 				}
+				wg.Done()
 			}()
 			tsvImporter.sendTSV(tsvRecordChan, readChan)
 		}()

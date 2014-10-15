@@ -8,7 +8,6 @@ import (
 	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/mongodb/mongo-tools/mongoimport"
 	"github.com/mongodb/mongo-tools/mongoimport/options"
-	"runtime"
 )
 
 func main() {
@@ -58,9 +57,6 @@ func main() {
 		log.Logf(0, "error validating settings: %v", err)
 		util.ExitFail()
 	}
-
-	// use all logical CPUs for concurrent operations
-	runtime.GOMAXPROCS(mongoImport.IngestOptions.NumThreads)
 
 	numDocs, err := mongoImport.ImportDocuments()
 	if err != nil {
