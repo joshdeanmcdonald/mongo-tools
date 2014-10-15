@@ -3,11 +3,37 @@ package mongoimport
 import (
 	"fmt"
 	"github.com/mongodb/mongo-tools/common/log"
+	"github.com/mongodb/mongo-tools/common/util"
 	"gopkg.in/mgo.v2/bson"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+// tokensToBSON reads in slice of records - along with ordered fields names -
+// and returns a BSON document for the record.
+func tokensToBSON(fields, tokens []string, numProcessed int64) (document bson.D) {
+	log.Logf(2, "got line: %v", tokens)
+	var parsedValue interface{}
+	for index, token := range tokens {
+		parsedValue = getParsedValue(token)
+		if index < len(fields) {
+			if strings.Index(fields[index], ".") != -1 {
+				setNestedValue(fields[index], parsedValue, &document)
+			} else {
+				document = append(document, bson.DocElem{fields[index], parsedValue})
+			}
+		} else {
+			key := "field" + string(index)
+			if util.StringSliceContains(fields, key) {
+				panic(fmt.Sprintf("Duplicate header name - on %v - for token #%v ('%v') in document #%v",
+					key, index+1, parsedValue, numProcessed))
+			}
+			document = append(document, bson.DocElem{key, parsedValue})
+		}
+	}
+	return
+}
 
 // constructUpsertDocument constructs a BSON document to use for upserts
 func constructUpsertDocument(upsertFields []string, document bson.M) bson.M {

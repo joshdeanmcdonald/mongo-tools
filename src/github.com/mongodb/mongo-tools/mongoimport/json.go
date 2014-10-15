@@ -36,8 +36,17 @@ type JSONInputReader struct {
 	// separator. It is a reader consisting of the decoder's buffer and the
 	// underlying reader
 	separatorReader io.Reader
-	// document is used to hold the decoded JSON document as a bson.M
-	document bson.M
+	/* internal synchronization helpers for sequential inserts */
+	// indicates a goroutine is currently processing a record
+	isProcessing bool
+	// indicates a waiting goroutine can commence processing a record
+	startProcessing chan bool
+	// indicates a goroutine has completed processing a record
+	hasProcessed chan bool
+	// document is used to hold each worker's processed TSV document as a bson.D
+	jsonOut bson.D
+	// string is used to hold the input TSV record for a worker to process
+	jsonIn []byte
 }
 
 const (
@@ -70,67 +79,142 @@ func NewJSONInputReader(isArray bool, in io.Reader) *JSONInputReader {
 }
 
 // SetHeader is a no-op for JSON imports
-func (jsonImporter *JSONInputReader) SetHeader(hasHeaderLine bool) error {
+func (jsonInputReader *JSONInputReader) SetHeader(hasHeaderLine bool) error {
 	return nil
 }
 
 // GetHeaders is a no-op for JSON imports
-func (jsonImporter *JSONInputReader) GetHeaders() []string {
+func (jsonInputReader *JSONInputReader) GetHeaders() []string {
 	return nil
 }
 
 // ReadHeadersFromSource is a no-op for JSON imports
-func (jsonImporter *JSONInputReader) ReadHeadersFromSource() ([]string, error) {
+func (jsonInputReader *JSONInputReader) ReadHeadersFromSource() ([]string, error) {
 	return nil, nil
 }
 
 // StreamDocument takes in two channels: it sends processed documents on the
-// readChan channel and if any error is encountered, that is sent in the errChan
-// channel. It keeps reading from the underlying input source until it hits EOF
-// or an error
-func (jsonImporter *JSONInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
+// readChan channel and if any error is encountered, the error is sent on the
+// errChan channel. It keeps reading from the underlying input source until it hits EOF
+// hits EOF or an error
+func (jsonInputReader *JSONInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
 	rawChan := make(chan []byte, numProcessingThreads)
 	var err error
 	go func() {
 		for {
-			if jsonImporter.IsArray {
-				if err = jsonImporter.readJSONArraySeparator(); err != nil {
+			if jsonInputReader.IsArray {
+				if err = jsonInputReader.readJSONArraySeparator(); err != nil {
 					close(rawChan)
 					if err == io.EOF {
 						errChan <- err
 						return
 					}
-					jsonImporter.numProcessed++
-					errChan <- fmt.Errorf("error reading separator after document #%v: %v", jsonImporter.numProcessed, err)
+					jsonInputReader.numProcessed++
+					errChan <- fmt.Errorf("error reading separator after document #%v: %v", jsonInputReader.numProcessed, err)
 					return
 				}
 			}
-			rawBytes, err := jsonImporter.Decoder.ScanObject()
+			rawBytes, err := jsonInputReader.Decoder.ScanObject()
 			if err != nil {
 				close(rawChan)
 				errChan <- err
 				return
 			}
 			rawChan <- rawBytes
-			jsonImporter.numProcessed++
+			jsonInputReader.numProcessed++
 		}
 	}()
 
-	var wg sync.WaitGroup
-	for i := 0; i < numProcessingThreads; i++ {
-		wg.Add(1)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Logf(0, "error decoding JSON: %v", r)
-				}
-				wg.Done()
+	if maintainInsertionOrder {
+		jsonInputReader.sequentialJSONStream(rawChan, readChan)
+	} else {
+		wg := &sync.WaitGroup{}
+		for i := 0; i < numProcessingThreads; i++ {
+			wg.Add(1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Logf(0, "error decoding JSON: %v", r)
+					}
+					wg.Done()
+				}()
+				jsonInputReader.concurrentJSONStream(rawChan, readChan)
 			}()
-			jsonImporter.decodeJSON(rawChan, readChan)
-		}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 	close(readChan)
+}
+
+// sequentialJSONStream concurrently processes data gotten from the rawBytesChan
+// channel in parallel and then sends over the processed data to the readChan
+// channel in sequence in which the data was received
+func (jsonInputReader *JSONInputReader) sequentialJSONStream(rawBytesChan chan []byte, readChan chan bson.D) {
+	var jsonWorkerThread []*JSONInputReader
+	// initialize all our concurrent processing threads
+	for i := 0; i < numProcessingThreads; i++ {
+		jsonWorker := &JSONInputReader{
+			hasProcessed:    make(chan bool),
+			startProcessing: make(chan bool),
+		}
+		jsonWorkerThread = append(jsonWorkerThread, jsonWorker)
+	}
+	i := 0
+	// feed in the JSON document to be processed and do round-robin
+	// reads from each worker once processing is completed
+	for jsonRecord := range rawBytesChan {
+		if jsonWorkerThread[i].isProcessing {
+			<-jsonWorkerThread[i].hasProcessed
+			readChan <- jsonWorkerThread[i].jsonOut
+		} else {
+			jsonWorkerThread[i].isProcessing = true
+			go jsonWorkerThread[i].doConcurrentProcess()
+		}
+		jsonWorkerThread[i].jsonIn = jsonRecord
+		jsonWorkerThread[i].startProcessing <- true
+		i = (i + 1) % numProcessingThreads
+	}
+	// drain any threads that're still in the middle of processing
+	for i := 0; i < numProcessingThreads; i++ {
+		if jsonWorkerThread[i].isProcessing {
+			<-jsonWorkerThread[i].hasProcessed
+			readChan <- jsonWorkerThread[i].jsonOut
+			close(jsonWorkerThread[i].startProcessing)
+		}
+	}
+}
+
+// concurrentJSONStream reads from the jsonRecordChan and for each read record,
+// converts it to a bson.D document before sending it on the readChan channel
+func (jsonInputReader *JSONInputReader) concurrentJSONStream(jsonRecordChan chan []byte, readChan chan bson.D) {
+	for jsonRecord := range jsonRecordChan {
+		readChan <- jsonInputReader.jsonRecordToBSON(jsonRecord)
+	}
+}
+
+// doConcurrentProcess waits on the startProcessing channel to process data and
+// sends a signal when it's done processing
+func (jsonInputReader *JSONInputReader) doConcurrentProcess() {
+	for <-jsonInputReader.startProcessing {
+		jsonInputReader.jsonOut = jsonInputReader.jsonRecordToBSON(jsonInputReader.jsonIn)
+		jsonInputReader.hasProcessed <- true
+	}
+}
+
+// jsonRecordToBSON reads in a byte slice and creates a BSON document - based on
+// the record - which is then returned
+func (jsonInputReader *JSONInputReader) jsonRecordToBSON(rawBytes []byte) (bsonD bson.D) {
+	document, err := json.UnmarshalBsonD(rawBytes)
+	if err != nil {
+		panic(fmt.Sprintf("error unmarshalling bytes on document #%v: %v", jsonInputReader.numProcessed, err))
+	}
+	log.Logf(2, "got line: %v", document)
+	// TODO: perhaps move this to decode.go
+	if bsonD, err = bsonutil.GetExtendedBsonD(document); err != nil {
+		panic(fmt.Sprintf("error getting extended BSON for document #%v: %v", jsonInputReader.numProcessed, err))
+	}
+	log.Logf(3, "got extended line: %#v", bsonD)
+	return
 }
 
 // readJSONArraySeparator is a helper method used to process JSON arrays. It is
@@ -140,23 +224,24 @@ func (jsonImporter *JSONInputReader) StreamDocument(readChan chan bson.D, errCha
 // It will read a byte at a time until it finds an expected character after
 // which it returns control to the caller.
 //
-// TODO: single byte sized scans are inefficient!
-//
 // It will also return immediately if it finds any error (including EOF). If it
 // reads a JSON_ARRAY_END byte, as a validity check it will continue to scan the
 // input source until it hits an error (including EOF) to ensure the entire
 // input source content is a valid JSON array
-func (jsonImporter *JSONInputReader) readJSONArraySeparator() error {
-	jsonImporter.expectedByte = JSON_ARRAY_SEP
-	if jsonImporter.numProcessed == 0 {
-		jsonImporter.expectedByte = JSON_ARRAY_START
+func (jsonInputReader *JSONInputReader) readJSONArraySeparator() error {
+	jsonInputReader.expectedByte = JSON_ARRAY_SEP
+	if jsonInputReader.numProcessed == 0 {
+		jsonInputReader.expectedByte = JSON_ARRAY_START
 	}
 
 	var readByte byte
 	scanp := 0
-	jsonImporter.separatorReader = io.MultiReader(jsonImporter.Decoder.Buffered(), jsonImporter.Decoder.R)
-	for readByte != jsonImporter.expectedByte {
-		n, err := jsonImporter.separatorReader.Read(jsonImporter.bytesFromReader)
+	jsonInputReader.separatorReader = io.MultiReader(
+		jsonInputReader.Decoder.Buffered(),
+		jsonInputReader.Decoder.R,
+	)
+	for readByte != jsonInputReader.expectedByte {
+		n, err := jsonInputReader.separatorReader.Read(jsonInputReader.bytesFromReader)
 		scanp += n
 		if n == 0 || err != nil {
 			if err == io.EOF {
@@ -164,21 +249,21 @@ func (jsonImporter *JSONInputReader) readJSONArraySeparator() error {
 			}
 			return err
 		}
-		readByte = jsonImporter.bytesFromReader[0]
+		readByte = jsonInputReader.bytesFromReader[0]
 
 		if readByte == JSON_ARRAY_END {
 			// if we read the end of the JSON array, ensure we have no other
 			// non-whitespace characters at the end of the array
 			for {
-				_, err = jsonImporter.separatorReader.Read(jsonImporter.bytesFromReader)
+				_, err = jsonInputReader.separatorReader.Read(jsonInputReader.bytesFromReader)
 				if err != nil {
 					// takes care of the '[]' case
-					if !jsonImporter.readOpeningBracket {
+					if !jsonInputReader.readOpeningBracket {
 						return ErrNoOpeningBracket
 					}
 					return err
 				}
-				readString := string(jsonImporter.bytesFromReader[0])
+				readString := string(jsonInputReader.bytesFromReader[0])
 				if strings.TrimSpace(readString) != "" {
 					return fmt.Errorf("bad JSON array format - found '%v' "+
 						"after '%v' in input source", readString,
@@ -193,7 +278,7 @@ func (jsonImporter *JSONInputReader) readJSONArraySeparator() error {
 			strings.TrimSpace(string(readByte)) == "" ||
 			readByte == JSON_ARRAY_START ||
 			readByte == JSON_ARRAY_END) {
-			if jsonImporter.expectedByte == JSON_ARRAY_START {
+			if jsonInputReader.expectedByte == JSON_ARRAY_START {
 				return ErrNoOpeningBracket
 			}
 			return fmt.Errorf("bad JSON array format - found '%v' outside "+
@@ -201,32 +286,11 @@ func (jsonImporter *JSONInputReader) readJSONArraySeparator() error {
 		}
 	}
 	// adjust the buffer to account for read bytes
-	if scanp < len(jsonImporter.Decoder.Buf) {
-		jsonImporter.Decoder.Buf = jsonImporter.Decoder.Buf[scanp:]
+	if scanp < len(jsonInputReader.Decoder.Buf) {
+		jsonInputReader.Decoder.Buf = jsonInputReader.Decoder.Buf[scanp:]
 	} else {
-		jsonImporter.Decoder.Buf = []byte{}
+		jsonInputReader.Decoder.Buf = []byte{}
 	}
-	jsonImporter.readOpeningBracket = true
+	jsonInputReader.readOpeningBracket = true
 	return nil
-}
-
-// decodeJSON reads in data from the rawChan channel and creates a BSON document
-// based on the record. It sends this document on the readChan channel if there
-// are no errors. If any error is encountered, it sends this on the errChan
-// channel and returns immediately
-func (jsonImporter *JSONInputReader) decodeJSON(rawChan chan []byte, readChan chan bson.D) {
-	var bsonD bson.D
-	for rawBytes := range rawChan {
-		document, err := json.UnmarshalBsonD(rawBytes)
-		if err != nil {
-			panic(fmt.Sprintf("error unmarshalling bytes on document #%v: %v", jsonImporter.numProcessed, err))
-		}
-		log.Logf(2, "got line: %v", document)
-		// TODO: could move this to decode.go
-		if bsonD, err = bsonutil.GetExtendedBsonD(document); err != nil {
-			panic(fmt.Sprintf("error getting extended BSON for document #%v: %v", jsonImporter.numProcessed, err))
-		}
-		log.Logf(3, "got extended line: %#v", bsonD)
-		readChan <- bsonD
-	}
 }

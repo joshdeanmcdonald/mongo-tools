@@ -11,7 +11,7 @@ type InputOptions struct {
 	JSONArray bool `long:"jsonArray" description:"output to a JSON array rather than one object per line"`
 
 	// Specifies the file type to import. The default format is JSON, but it’s possible to import CSV and TSV files.
-	Type string `long:"type" default:"json" description:"type of file to import (JSON, CSV, TSV only)"`
+	Type string `long:"type" default:"json" description:"type of file to import (json, csv, tsv only)"`
 
 	// Specifies the location and name of a file containing the data to import.
 	// If you do not specify a file, mongoimport reads data from standard input (e.g. “stdin”).
@@ -19,7 +19,7 @@ type InputOptions struct {
 
 	// If using --type csv or --type tsv, uses the first line as field names.
 	// Otherwise, mongoimport will import the first line as a distinct document.
-	HeaderLine bool `long:"headerline" description:"first line in input file is a header (CSV and TSV only)"`
+	HeaderLine bool `long:"headerline" description:"if given, the first line in input file would be used for each document's key list (csv and tsv only)"`
 }
 
 func (self *InputOptions) Name() string {
@@ -54,7 +54,7 @@ type IngestOptions struct {
 	/*	CPU and Network I/O related configurations	*/
 
 	// Specifies the number of operating system threads to use during the import process
-	MaintainInsertionOrder bool `long:"maintainInsertionOrder" description:"documents should be inserted in the order of their appearance in the input source"`
+	MaintainInsertionOrder bool `long:"maintainInsertionOrder" description:"if given, documents should be inserted in the order of their appearance in the input source"`
 
 	// Specifies the number of operating system threads to use during the import process
 	NumOSThreads *int `long:"numOsThreads" description:"number of operating system threads to use (defaults to the number of logical CPUs)"`

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/mongodb/mongo-tools/common/log"
-	"github.com/mongodb/mongo-tools/common/util"
 	"gopkg.in/mgo.v2/bson"
 	"io"
 	"strings"
@@ -28,8 +27,17 @@ type TSVInputReader struct {
 	numProcessed int64
 	// tsvRecord stores each line of input we read from the underlying reader
 	tsvRecord string
-	// document is used to hold the decoded JSON document as a bson.M
-	document bson.M
+	/* internal synchronization helpers for sequential inserts */
+	// indicates a goroutine is currently processing a record
+	isProcessing bool
+	// indicates a waiting goroutine can commence processing a record
+	startProcessing chan bool
+	// indicates a goroutine has completed processing a record
+	hasProcessed chan bool
+	// document is used to hold each worker's processed TSV document as a bson.D
+	tsvOut bson.D
+	// string is used to hold the input TSV record for a worker to process
+	tsvIn string
 }
 
 // NewTSVInputReader returns a TSVInputReader configured to read input from the
@@ -42,24 +50,24 @@ func NewTSVInputReader(fields []string, in io.Reader) *TSVInputReader {
 }
 
 // SetHeader sets the header field for a TSV
-func (tsvImporter *TSVInputReader) SetHeader(hasHeaderLine bool) (err error) {
-	fields, err := validateHeaders(tsvImporter, hasHeaderLine)
+func (tsvInputReader *TSVInputReader) SetHeader(hasHeaderLine bool) (err error) {
+	fields, err := validateHeaders(tsvInputReader, hasHeaderLine)
 	if err != nil {
 		return err
 	}
-	tsvImporter.Fields = fields
+	tsvInputReader.Fields = fields
 	return nil
 }
 
 // GetHeaders returns the current header fields for a TSV importer
-func (tsvImporter *TSVInputReader) GetHeaders() []string {
-	return tsvImporter.Fields
+func (tsvInputReader *TSVInputReader) GetHeaders() []string {
+	return tsvInputReader.Fields
 }
 
 // ReadHeadersFromSource reads the header field from the TSV importer's reader
-func (tsvImporter *TSVInputReader) ReadHeadersFromSource() ([]string, error) {
+func (tsvInputReader *TSVInputReader) ReadHeadersFromSource() ([]string, error) {
 	unsortedHeaders := []string{}
-	stringHeaders, err := tsvImporter.tsvReader.ReadString(entryDelimiter)
+	stringHeaders, err := tsvInputReader.tsvReader.ReadString(entryDelimiter)
 	if err != nil {
 		return nil, err
 	}
@@ -71,80 +79,111 @@ func (tsvImporter *TSVInputReader) ReadHeadersFromSource() ([]string, error) {
 }
 
 // StreamDocument takes in two channels: it sends processed documents on the
-// readChan channel and if any error is encountered, that is sent in the errChan
-// channel. It keeps reading from the underlying input source until it hits EOF
-// or an error
-func (tsvImporter *TSVInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
+// readChan channel and if any error is encountered, the error is sent on the
+// errChan channel. It keeps reading from the underlying input source until it hits EOF
+// hits EOF or an error
+func (tsvInputReader *TSVInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
 	tsvRecordChan := make(chan string, numProcessingThreads)
 	var err error
 
 	go func() {
 		for {
-			tsvImporter.tsvRecord, err = tsvImporter.tsvReader.ReadString(entryDelimiter)
+			tsvInputReader.tsvRecord, err = tsvInputReader.tsvReader.ReadString(entryDelimiter)
 			if err != nil {
 				close(tsvRecordChan)
 				if err == io.EOF {
 					errChan <- err
 					return
 				}
-				tsvImporter.numProcessed++
-				errChan <- fmt.Errorf("read error on entry #%v: %v", tsvImporter.numProcessed, err)
+				tsvInputReader.numProcessed++
+				errChan <- fmt.Errorf("read error on entry #%v: %v", tsvInputReader.numProcessed, err)
 				return
 			}
-			tsvRecordChan <- tsvImporter.tsvRecord
-			tsvImporter.numProcessed++
+			tsvRecordChan <- tsvInputReader.tsvRecord
+			tsvInputReader.numProcessed++
 		}
 	}()
 
-	var wg sync.WaitGroup
-	for i := 0; i < numProcessingThreads; i++ {
-		wg.Add(1)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Logf(0, "error decoding TSV: %v", r)
-				}
-				wg.Done()
+	if maintainInsertionOrder {
+		tsvInputReader.sequentialTSVStream(tsvRecordChan, readChan)
+	} else {
+		wg := &sync.WaitGroup{}
+		for i := 0; i < numProcessingThreads; i++ {
+			wg.Add(1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Logf(0, "error decoding TSV: %v", r)
+					}
+					wg.Done()
+				}()
+				tsvInputReader.concurrentTSVStream(tsvRecordChan, readChan)
 			}()
-			tsvImporter.sendTSV(tsvRecordChan, readChan)
-		}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 	close(readChan)
 }
 
-// sendTSV reads in data from the tsvRecordChan channel and creates a BSON document
-// based on the record. It sends this document on the readChan channel if there
-// are no errors. If any error is encountered, it sends this on the errChan
-// channel and returns immediately
-func (tsvImporter *TSVInputReader) sendTSV(tsvRecordChan chan string, readChan chan bson.D) {
-	var key string
-	var document bson.D
+// sequentialTSVStream concurrently processes data gotten from the tsvRecordChan
+// channel in parallel and then sends over the processed data to the readChan
+// channel in sequence in which the data was received
+func (tsvInputReader *TSVInputReader) sequentialTSVStream(tsvRecordChan chan string, readChan chan bson.D) {
+	var tsvWorkerThread []*TSVInputReader
+	// initialize all our concurrent processing threads
+	for i := 0; i < numProcessingThreads; i++ {
+		tsvWorker := &TSVInputReader{
+			Fields:          tsvInputReader.Fields,
+			hasProcessed:    make(chan bool),
+			startProcessing: make(chan bool),
+		}
+		tsvWorkerThread = append(tsvWorkerThread, tsvWorker)
+	}
+	i := 0
+	// feed in the TSV line to be processed and do round-robin
+	// reads from each worker once processing is completed
 	for tsvRecord := range tsvRecordChan {
-		log.Logf(2, "got line: %v", tsvRecord)
+		if tsvWorkerThread[i].isProcessing {
+			<-tsvWorkerThread[i].hasProcessed
+			readChan <- tsvWorkerThread[i].tsvOut
+		} else {
+			tsvWorkerThread[i].isProcessing = true
+			go tsvWorkerThread[i].doConcurrentProcess()
+		}
+		tsvWorkerThread[i].tsvIn = tsvRecord
+		tsvWorkerThread[i].startProcessing <- true
+		i = (i + 1) % numProcessingThreads
+	}
+	// drain any threads that're still in the middle of processing
+	for i := 0; i < numProcessingThreads; i++ {
+		if tsvWorkerThread[i].isProcessing {
+			<-tsvWorkerThread[i].hasProcessed
+			readChan <- tsvWorkerThread[i].tsvOut
+			close(tsvWorkerThread[i].startProcessing)
+		}
+	}
+}
 
-		// strip the trailing '\r\n' from ReadString
-		if len(tsvRecord) != 0 {
-			tsvRecord = strings.TrimRight(tsvRecord, "\r\n")
-		}
-		document = bson.D{}
-		for index, token := range strings.Split(tsvRecord, tokenSeparator) {
-			parsedValue := getParsedValue(token)
-			if index < len(tsvImporter.Fields) {
-				if strings.Index(tsvImporter.Fields[index], ".") != -1 {
-					setNestedValue(tsvImporter.Fields[index], parsedValue, &document)
-				} else {
-					document = append(document, bson.DocElem{tsvImporter.Fields[index], parsedValue})
-				}
-			} else {
-				key = "field" + string(index)
-				if util.StringSliceContains(tsvImporter.Fields, key) {
-					panic(fmt.Sprintf("Duplicate header name - on %v - for token #%v ('%v') in document #%v",
-						key, index+1, parsedValue, tsvImporter.numProcessed))
-				}
-				document = append(document, bson.DocElem{key, parsedValue})
-			}
-		}
-		readChan <- document
+// concurrentTSVStream reads from the tsvRecordChan and for each read record, converts it to
+// a bson.D document before sending it on the readChan channel
+func (tsvInputReader *TSVInputReader) concurrentTSVStream(tsvRecordChan chan string, readChan chan bson.D) {
+	for tsvRecord := range tsvRecordChan {
+		readChan <- tsvInputReader.tsvRecordToBSON(tsvRecord)
+	}
+}
+
+// tsvRecordToBSON reads a TSV record and returns a BSON document constructed
+// from the TSV input source's fields and the given record
+func (tsvInputReader *TSVInputReader) tsvRecordToBSON(tsvRecord string) bson.D {
+	tsvTokens := strings.Split(strings.TrimRight(tsvRecord, "\r\n"), tokenSeparator)
+	return tokensToBSON(tsvInputReader.Fields, tsvTokens, tsvInputReader.numProcessed)
+}
+
+// doConcurrentProcess waits on the startProcessing channel to process data and
+// sends a signal when it's done processing
+func (tsvInputReader *TSVInputReader) doConcurrentProcess() {
+	for <-tsvInputReader.startProcessing {
+		tsvInputReader.tsvOut = tsvInputReader.tsvRecordToBSON(tsvInputReader.tsvIn)
+		tsvInputReader.hasProcessed <- true
 	}
 }

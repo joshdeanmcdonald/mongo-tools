@@ -371,7 +371,9 @@ func (mongoImport *MongoImport) IngestDocuments(readChan chan bson.D) (err error
 
 	for err = range ingestErr {
 		doneIngestionThreads++
-		// TODO suggestion: perhaps signal other workers to terminate immediately
+		// an error in any goroutine will immediately be propagated to the
+		// and will cause the program to exit so we don't terminate the other
+		// ingestion threads here
 		if err != nil {
 			return
 		}

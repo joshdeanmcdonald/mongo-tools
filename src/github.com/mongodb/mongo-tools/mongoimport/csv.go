@@ -3,11 +3,9 @@ package mongoimport
 import (
 	"fmt"
 	"github.com/mongodb/mongo-tools/common/log"
-	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/mongodb/mongo-tools/mongoimport/csv"
 	"gopkg.in/mgo.v2/bson"
 	"io"
-	"strings"
 	"sync"
 )
 
@@ -23,13 +21,16 @@ type CSVInputReader struct {
 	numProcessed int64
 	// csvRecord stores each line of input we read from the underlying reader
 	csvRecord []string
-	// internal synchronization helpers
-	isProcessing    bool
+	/* internal synchronization helpers for sequential inserts */
+	// indicates a goroutine is currently processing a record
+	isProcessing bool
+	// indicates a waiting goroutine can commence processing a record
 	startProcessing chan bool
-	hasProcessed    chan bool
-	// document is used to hold the processed CSV document as a bson.D
+	// indicates a goroutine has completed processing a record
+	hasProcessed chan bool
+	// document is used to hold each worker's processed CSV document as a bson.D
 	csvOut bson.D
-	// document is used to hold the input CSV document to process
+	// slice is used to hold the input CSV document for a worker to process
 	csvIn []string
 }
 
@@ -67,9 +68,9 @@ func (csvInputReader *CSVInputReader) ReadHeadersFromSource() ([]string, error) 
 }
 
 // StreamDocument takes in two channels: it sends processed documents on the
-// readChan channel and if any error is encountered, that is sent in the errChan
-// channel. It keeps reading from the underlying input source until it hits EOF
-// or an error
+// readChan channel and if any error is encountered, the error is sent on the
+// errChan channel. It keeps reading from the underlying input source until it hits EOF
+// hits EOF or an error
 func (csvInputReader *CSVInputReader) StreamDocument(readChan chan bson.D, errChan chan error) {
 	csvRecordChan := make(chan []string, numProcessingThreads)
 	var err error
@@ -93,7 +94,7 @@ func (csvInputReader *CSVInputReader) StreamDocument(readChan chan bson.D, errCh
 	}()
 
 	if maintainInsertionOrder {
-		csvInputReader.processInSequence(csvRecordChan, readChan)
+		csvInputReader.sequentialTSVStream(csvRecordChan, readChan)
 	} else {
 		wg := &sync.WaitGroup{}
 		for i := 0; i < numProcessingThreads; i++ {
@@ -105,7 +106,7 @@ func (csvInputReader *CSVInputReader) StreamDocument(readChan chan bson.D, errCh
 					}
 					wg.Done()
 				}()
-				csvInputReader.sendCSV(csvRecordChan, readChan)
+				csvInputReader.concurrentCSVStream(csvRecordChan, readChan)
 			}()
 		}
 		wg.Wait()
@@ -113,45 +114,10 @@ func (csvInputReader *CSVInputReader) StreamDocument(readChan chan bson.D, errCh
 	close(readChan)
 }
 
-// sendCSV reads from the csvRecordChan and for each read record, converts it to
-// a bson.D document before sending it on the readChan channel
-func (csvInputReader *CSVInputReader) sendCSV(csvRecordChan chan []string, readChan chan bson.D) {
-	for csvRecord := range csvRecordChan {
-		readChan <- csvInputReader.csvRecordToBSON(csvRecord)
-	}
-}
-
-// csvRecordToBSON reads in slice of CSV record and returns a BSON document based
-// on the record.
-func (csvInputReader *CSVInputReader) csvRecordToBSON(csvRecord []string) (document bson.D) {
-	log.Logf(2, "got line: %v", csvRecord)
-	var parsedValue interface{}
-	for index, token := range csvRecord {
-		parsedValue = getParsedValue(token)
-		if index < len(csvInputReader.Fields) {
-			// for nested fields - in the form "a.b.c", ensure
-			// that the value is set accordingly
-			if strings.Index(csvInputReader.Fields[index], ".") != -1 {
-				setNestedValue(csvInputReader.Fields[index], parsedValue, &document)
-			} else {
-				document = append(document, bson.DocElem{csvInputReader.Fields[index], parsedValue})
-			}
-		} else {
-			key := "field" + string(index)
-			if util.StringSliceContains(csvInputReader.Fields, key) {
-				panic(fmt.Sprintf("Duplicate header name - on %v - for token #%v ('%v') in document #%v",
-					key, index+1, parsedValue, csvInputReader.numProcessed))
-			}
-			document = append(document, bson.DocElem{csvInputReader.Fields[index], parsedValue})
-		}
-	}
-	return
-}
-
-// processInSequence concurrently processes data gotten from the csvRecordChan
+// sequentialTSVStream concurrently processes data gotten from the csvRecordChan
 // channel in parallel and then sends over the processed data to the readChan
 // channel in sequence in which the data was received
-func (csvInputReader *CSVInputReader) processInSequence(csvRecordChan chan []string, readChan chan bson.D) {
+func (csvInputReader *CSVInputReader) sequentialTSVStream(csvRecordChan chan []string, readChan chan bson.D) {
 	var csvWorkerThread []*CSVInputReader
 	// initialize all our concurrent processing threads
 	for i := 0; i < numProcessingThreads; i++ {
@@ -171,13 +137,13 @@ func (csvInputReader *CSVInputReader) processInSequence(csvRecordChan chan []str
 			readChan <- csvWorkerThread[i].csvOut
 		} else {
 			csvWorkerThread[i].isProcessing = true
-			go csvWorkerThread[i].processCSV()
+			go csvWorkerThread[i].doConcurrentProcess()
 		}
 		csvWorkerThread[i].csvIn = csvRecord
 		csvWorkerThread[i].startProcessing <- true
 		i = (i + 1) % numProcessingThreads
 	}
-	// drain any thread that's still in the middle of processing
+	// drain any threads that're still in the middle of processing
 	for i := 0; i < numProcessingThreads; i++ {
 		if csvWorkerThread[i].isProcessing {
 			<-csvWorkerThread[i].hasProcessed
@@ -187,11 +153,29 @@ func (csvInputReader *CSVInputReader) processInSequence(csvRecordChan chan []str
 	}
 }
 
-// processCSV waits on the startProcessing channel to process data and sends
-// a signal when it's done processing
-func (csvInputReader *CSVInputReader) processCSV() {
+// concurrentCSVStream reads from the csvRecordChan and for each read record,
+// converts it to a bson.D document before sending it on the readChan channel
+func (csvInputReader *CSVInputReader) concurrentCSVStream(csvRecordChan chan []string, readChan chan bson.D) {
+	for csvRecord := range csvRecordChan {
+		readChan <- csvInputReader.csvRecordToBSON(csvRecord)
+	}
+}
+
+// csvRecordToBSON reads a CSV record and returns a BSON document constructed
+// from the CSV input source's fields and the given record
+func (csvInputReader *CSVInputReader) csvRecordToBSON(csvRecord []string) (document bson.D) {
+	return tokensToBSON(csvInputReader.Fields, csvInputReader.csvIn, csvInputReader.numProcessed)
+}
+
+// doConcurrentProcess waits on the startProcessing channel to process data and
+// sends a signal when it's done processing
+func (csvInputReader *CSVInputReader) doConcurrentProcess() {
 	for <-csvInputReader.startProcessing {
-		csvInputReader.csvOut = csvRecordToBSON(csvInputReader.csvIn)
+		csvInputReader.csvOut = tokensToBSON(
+			csvInputReader.Fields,
+			csvInputReader.csvIn,
+			csvInputReader.numProcessed,
+		)
 		csvInputReader.hasProcessed <- true
 	}
 }
